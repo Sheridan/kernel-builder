@@ -71,6 +71,8 @@ class Logger:
         self.logger.info(f"==> {cmd_str}")
 
     def command_output(self, output, error=False):
+        if not output:
+            return
         lines = output.strip().split('\n')
         for line in lines:
             if line:
@@ -101,14 +103,12 @@ class Config:
             if key not in self.data:
                 raise ValueError(f"Missing key in config: {key}")
 
-        # Check if directories exist and are accessible
-        dirs_to_check = ["linux_dir", "backup_config_dir", "boot_mountpoint"]
-        for dir_key in dirs_to_check:
-            dir_path = self.data[dir_key]
-            if not os.path.exists(dir_path):
-                raise ValueError(f"Directory does not exist: {dir_path} ({dir_key})")
-            if not os.access(dir_path, os.R_OK):
-                raise ValueError(f"Directory is not readable: {dir_path} ({dir_key})")
+        # Only check if source directory (linux_dir) exists
+        linux_dir = self.data["linux_dir"]
+        if not os.path.exists(linux_dir):
+            raise ValueError(f"Linux source directory does not exist: {linux_dir}")
+        if not os.access(linux_dir, os.R_OK | os.W_OK):
+            raise ValueError(f"Linux source directory is not readable/writable: {linux_dir}")
 
     def get(self, key, default=None):
         return self.data.get(key, default)
@@ -127,6 +127,36 @@ class Kernel:
         self._kernel_version = None
         self._build_datetime = None
         self.logger = config.logger
+        self._built = False
+
+        # Create required directories
+        os.makedirs(self.backup_config_dir, exist_ok=True)
+        os.makedirs(self.boot_mountpoint, exist_ok=True)
+
+        # Check for required tools
+        self._check_dependencies()
+
+    def _check_dependencies(self):
+        """Check if required build tools are available"""
+        tools = ["make", "genkernel", "grub-mkconfig"]
+        missing = []
+
+        for tool in tools:
+            try:
+                result = subprocess.run(
+                    ["which", tool],
+                    text=True,
+                    capture_output=True,
+                    check=False
+                )
+                if result.returncode != 0:
+                    missing.append(tool)
+            except Exception:
+                missing.append(tool)
+
+        if missing:
+            self.logger.warning(f"Required tools missing: {', '.join(missing)}")
+            self.logger.warning("Some operations may fail.")
 
     @property
     def kernel_version(self):
@@ -140,7 +170,29 @@ class Kernel:
                     self.logger.error(f"Cannot read kernel version file: {e}")
                     self._kernel_version = "unknown"
             else:
-                self._kernel_version = "unknown"
+                vmlinux_file = os.path.join(self.linux_dir, "vmlinux")
+                if os.path.isfile(vmlinux_file):
+                    try:
+                        result = subprocess.run(
+                            ["strings", vmlinux_file, "|", "grep", "Linux version"],
+                            shell=True,
+                            text=True,
+                            capture_output=True
+                        )
+                        if result.returncode == 0 and result.stdout:
+                            # Extract version from "Linux version X.Y.Z ..."
+                            version_line = result.stdout.strip().split("\n")[0]
+                            parts = version_line.split()
+                            if len(parts) >= 3:
+                                self._kernel_version = parts[2]
+                            else:
+                                self._kernel_version = "unknown"
+                        else:
+                            self._kernel_version = "unknown"
+                    except Exception:
+                        self._kernel_version = "unknown"
+                else:
+                    self._kernel_version = "unknown"
         return self._kernel_version
 
     @property
@@ -219,21 +271,53 @@ class Kernel:
                 self.logger.error(f"Ошибка при копировании .config: {e}")
 
     def build(self):
+        """Build the kernel only, not the initramfs"""
         self.logger.info("---> Сборка ядра <---")
         self.run(["make", f"-j{self.build_jobs}", "bzImage", "modules"], cwd=self.linux_dir)
+        self.logger.info("Сборка ядра завершена.")
+        self._built = True
+
+    def is_kernel_built(self) -> bool:
+        """Check if kernel has been built"""
+        if self._built:
+            return True
+
+        # Check for kernel binary
+        vmlinuz = os.path.join(self.linux_dir, "arch/x86/boot/bzImage")
+        if not os.path.exists(vmlinuz):
+            self.logger.warning("Ядро не скомпилировано (bzImage не найден)")
+            return False
+
+        return True
+
+    def install(self):
+        """Install the built kernel and modules, build initramfs"""
+        if not self.is_kernel_built():
+            self.logger.error("Ядро не скомпилировано. Сначала выполните 'build'")
+            sys.exit(1)
+
+        self.logger.info("---> Установка ядра <---")
         self.run(["make", "modules_install", "install"], cwd=self.linux_dir)
-        self.logger.info("---> Сборка initramfs <---")
+
+        self.logger.info("---> Сборка и установка initramfs <---")
         genkernel_cmd = ["genkernel"] + self.initramfs_args + ["initramfs"]
         self.run(genkernel_cmd)
+
         self.logger.info("---> Переименование файлов ядра <---")
         self.rename_kernel_files()
         self.run(["grub-mkconfig", "-o", "/boot/grub/grub.cfg"])
-        self.logger.info("Сборка завершена.")
+        self.logger.info("Установка завершена.")
 
     def rename_kernel_files(self):
         dt = self.build_datetime
         kv = self.kernel_version
         boot = self.boot_mountpoint
+
+        # Ensure boot directory exists
+        if not os.path.exists(boot):
+            self.logger.error(f"Boot directory {boot} does not exist")
+            return
+
         for f in ["System.map", "vmlinuz"]:
             src = os.path.join(boot, f)
             if os.path.exists(src):
@@ -260,6 +344,15 @@ class BootDevice:
         self.partition = partition
         self.mountpoint = mountpoint
         self.logger = logger
+
+        # Verify devices exist
+        self.verify_device()
+
+    def verify_device(self):
+        """Check if the device exists"""
+        dev = self.device + self.partition
+        if not os.path.exists(dev):
+            self.logger.warning(f"Устройство {dev} не найдено!")
 
     def mount(self):
         dev = self.device + self.partition
@@ -297,20 +390,46 @@ class BootDevice:
         except Exception as e:
             self.logger.error(f"Ошибка при просмотре содержимого {self.mountpoint}: {e}")
 
+    def find_grub_path(self) -> str:
+        """Find the correct grub.cfg path on the mounted device"""
+        possible_paths = [
+            os.path.join(self.mountpoint, "grub"),
+            os.path.join(self.mountpoint, "boot/grub"),
+            os.path.join(self.mountpoint, "grub2"),
+            os.path.join(self.mountpoint, "boot/grub2")
+        ]
+
+        for path in possible_paths:
+            if os.path.isdir(path):
+                return os.path.join(path, "grub.cfg")
+
+        # Default to standard path if not found
+        self.logger.warning("Grub directory not found, using default path")
+        return os.path.join(self.mountpoint, "grub/grub.cfg")
+
     def install_kernel(self, kernel: Kernel):
         try:
             self.umount()
             self.mount()
             self.logger.info(f"---> Файлы в {self.mountpoint} до установки:")
             self.show_boot()
-            kernel.build()
+
+            # Only install - no building
+            kernel.install()
+
             self.logger.info(f"---> Файлы в {self.mountpoint} после установки:")
             self.show_boot()
             self.logger.info("---> Генерация grub.cfg на устройстве")
 
-            grub_cfg_path = os.path.join(self.mountpoint, "grub/grub.cfg")
+            grub_cfg_path = self.find_grub_path()
+            grub_dir = os.path.dirname(grub_cfg_path)
+
+            # Create directory if needed
+            if not os.path.exists(grub_dir):
+                os.makedirs(grub_dir, exist_ok=True)
+
             result = subprocess.run(["grub-mkconfig", "-o", grub_cfg_path],
-                                   text=True, capture_output=True)
+                                  text=True, capture_output=True)
 
             if result.stdout:
                 self.logger.command_output(result.stdout)
@@ -343,8 +462,13 @@ def main():
         if args.command == "configure":
             kernel.configure()
         elif args.command == "build":
-            kernel.build()
+            kernel.build()  # Only build, no installation
         elif args.command == "install":
+            # First check if kernel is built
+            if not kernel.is_kernel_built():
+                config.logger.error("Ядро не скомпилировано. Сначала выполните 'build'")
+                sys.exit(1)
+
             flashlist = config.get_flash_devices()
             for flash in flashlist:
                 device = BootDevice(
@@ -353,7 +477,7 @@ def main():
                     mountpoint=config.get("boot_mountpoint"),
                     logger=config.logger
                 )
-                device.install_kernel(kernel)
+                device.install_kernel(kernel)  # This will install only, not build
         else:
             config.logger.error("Неизвестная команда")
             sys.exit(2)
