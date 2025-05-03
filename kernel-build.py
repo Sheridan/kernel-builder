@@ -8,19 +8,10 @@ import shutil
 import json
 import datetime
 import logging
-from typing import Union, List, Dict, Any, Optional
 
 class Logger:
     def __init__(self, config: dict):
         self.log_file = config.get("log_file", "/var/log/kernel-build.log")
-        log_level_str = config.get("log_level", "INFO").upper()
-        level_map = {
-            "DEBUG": logging.DEBUG,
-            "INFO": logging.INFO,
-            "WARNING": logging.WARNING,
-            "ERROR": logging.ERROR
-        }
-        log_level = level_map.get(log_level_str, logging.INFO)
 
         # Create log directory if it doesn't exist
         try:
@@ -33,19 +24,17 @@ class Logger:
 
         # Configure logging
         self.logger = logging.getLogger("kernel-build")
-        self.logger.setLevel(log_level)
-
-        # Remove any existing handlers
+        self.logger.setLevel(logging.INFO)
         self.logger.handlers = []
 
         # File handler
         if self.log_file:
             try:
                 file_handler = logging.FileHandler(self.log_file)
-                file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+                file_formatter = logging.Formatter('%(asctime)s - %(message)s')
                 file_handler.setFormatter(file_formatter)
                 self.logger.addHandler(file_handler)
-            except (OSError, PermissionError) as e:
+            except Exception as e:
                 print(f"Warning: Cannot write to log file: {e}", file=sys.stderr)
 
         # Console handler
@@ -54,14 +43,8 @@ class Logger:
         console_handler.setFormatter(console_formatter)
         self.logger.addHandler(console_handler)
 
-    def debug(self, message):
-        self.logger.debug(message)
-
     def info(self, message):
         self.logger.info(message)
-
-    def warning(self, message):
-        self.logger.warning(message)
 
     def error(self, message):
         self.logger.error(message)
@@ -70,16 +53,20 @@ class Logger:
         cmd_str = ' '.join(cmd) if isinstance(cmd, list) else cmd
         self.logger.info(f"==> {cmd_str}")
 
-    def command_output(self, output, error=False):
-        if not output:
+    def command_output(self, line, error=False):
+        """Process a single line of output"""
+        if not line:
             return
-        lines = output.strip().split('\n')
-        for line in lines:
-            if line:
-                if error:
-                    self.logger.error(f"   {line}")
-                else:
-                    self.logger.debug(f"   {line}")
+
+        # Always log to file
+        if error:
+            self.logger.error(f"   {line}")
+        else:
+            self.logger.info(f"   {line}")
+
+        # For console: overwrite the previous line
+        print(f"\r   {line}", end="", flush=True)
+
 
 class Config:
     def __init__(self, path):
@@ -103,13 +90,6 @@ class Config:
             if key not in self.data:
                 raise ValueError(f"Missing key in config: {key}")
 
-        # Only check if source directory (linux_dir) exists
-        linux_dir = self.data["linux_dir"]
-        if not os.path.exists(linux_dir):
-            raise ValueError(f"Linux source directory does not exist: {linux_dir}")
-        if not os.access(linux_dir, os.R_OK | os.W_OK):
-            raise ValueError(f"Linux source directory is not readable/writable: {linux_dir}")
-
     def get(self, key, default=None):
         return self.data.get(key, default)
 
@@ -128,71 +108,21 @@ class Kernel:
         self._build_datetime = None
         self.logger = config.logger
         self._built = False
+        self.temp_dir = None
 
         # Create required directories
         os.makedirs(self.backup_config_dir, exist_ok=True)
         os.makedirs(self.boot_mountpoint, exist_ok=True)
-
-        # Check for required tools
-        self._check_dependencies()
-
-    def _check_dependencies(self):
-        """Check if required build tools are available"""
-        tools = ["make", "genkernel", "grub-mkconfig"]
-        missing = []
-
-        for tool in tools:
-            try:
-                result = subprocess.run(
-                    ["which", tool],
-                    text=True,
-                    capture_output=True,
-                    check=False
-                )
-                if result.returncode != 0:
-                    missing.append(tool)
-            except Exception:
-                missing.append(tool)
-
-        if missing:
-            self.logger.warning(f"Required tools missing: {', '.join(missing)}")
-            self.logger.warning("Some operations may fail.")
 
     @property
     def kernel_version(self):
         if not self._kernel_version:
             rel_file = os.path.join(self.linux_dir, "include/config/kernel.release")
             if os.path.isfile(rel_file):
-                try:
-                    with open(rel_file) as f:
-                        self._kernel_version = f.read().strip()
-                except IOError as e:
-                    self.logger.error(f"Cannot read kernel version file: {e}")
-                    self._kernel_version = "unknown"
+                with open(rel_file) as f:
+                    self._kernel_version = f.read().strip()
             else:
-                vmlinux_file = os.path.join(self.linux_dir, "vmlinux")
-                if os.path.isfile(vmlinux_file):
-                    try:
-                        result = subprocess.run(
-                            ["strings", vmlinux_file, "|", "grep", "Linux version"],
-                            shell=True,
-                            text=True,
-                            capture_output=True
-                        )
-                        if result.returncode == 0 and result.stdout:
-                            # Extract version from "Linux version X.Y.Z ..."
-                            version_line = result.stdout.strip().split("\n")[0]
-                            parts = version_line.split()
-                            if len(parts) >= 3:
-                                self._kernel_version = parts[2]
-                            else:
-                                self._kernel_version = "unknown"
-                        else:
-                            self._kernel_version = "unknown"
-                    except Exception:
-                        self._kernel_version = "unknown"
-                else:
-                    self._kernel_version = "unknown"
+                self._kernel_version = "unknown"
         return self._kernel_version
 
     @property
@@ -201,44 +131,55 @@ class Kernel:
             self._build_datetime = datetime.datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
         return self._build_datetime
 
-    def run(self, cmd: Union[List[str], str], cwd: Optional[str] = None, check: bool = True) -> subprocess.CompletedProcess:
+    def run(self, cmd, cwd=None, check=True):
         self.logger.command(cmd)
-        try:
-            result = subprocess.run(
-                cmd,
-                shell=isinstance(cmd, str),
-                cwd=cwd,
-                text=True,
-                capture_output=True
-            )
 
-            # Log stdout and stderr
-            if result.stdout:
-                self.logger.command_output(result.stdout)
-            if result.stderr:
-                self.logger.command_output(result.stderr, error=True)
+        # Use Popen to capture output in real-time
+        process = subprocess.Popen(
+            cmd,
+            shell=isinstance(cmd, str),
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=1,
+            universal_newlines=True
+        )
 
-            if check and result.returncode != 0:
-                self.logger.error(f"Command failed with exit code {result.returncode}")
-                sys.exit(result.returncode)
-            return result
-        except Exception as e:
-            self.logger.error(f"Failed to execute command: {e}")
-            if check:
-                sys.exit(1)
-            raise
+        # Process stdout and stderr streams
+        while True:
+            stdout_line = process.stdout.readline()
+            if stdout_line:
+                self.logger.command_output(stdout_line.rstrip())
+
+            stderr_line = process.stderr.readline()
+            if stderr_line:
+                self.logger.command_output(stderr_line.rstrip(), error=True)
+
+            # Check if process has finished
+            if process.poll() is not None:
+                break
+
+        # Get return code
+        return_code = process.poll()
+
+        # Print a newline to prepare for next output
+        print()
+
+        if check and return_code != 0:
+            self.logger.error(f"Command failed with exit code {return_code}")
+            sys.exit(return_code)
+
+        return return_code
 
     def backup_config(self):
         src = os.path.join(self.linux_dir, ".config")
         if os.path.exists(src):
-            try:
-                os.makedirs(self.backup_config_dir, exist_ok=True)
-                dt = datetime.datetime.now().strftime("%Y.%m.%d-%H:%M:%S")
-                dst = os.path.join(self.backup_config_dir, f".config.{dt}")
-                shutil.copy2(src, dst)
-                self.logger.info(f"Старая конфигурация ядра сохранена: {dst}")
-            except (OSError, shutil.Error) as e:
-                self.logger.error(f"Ошибка при бэкапе конфигурации: {e}")
+            os.makedirs(self.backup_config_dir, exist_ok=True)
+            dt = datetime.datetime.now().strftime("%Y.%m.%d-%H:%M:%S")
+            dst = os.path.join(self.backup_config_dir, f".config.{dt}")
+            shutil.copy2(src, dst)
+            self.logger.info(f"Старая конфигурация ядра сохранена: {dst}")
         else:
             self.logger.info(f".config не найден, пропуск бэкапа.")
 
@@ -247,28 +188,22 @@ class Kernel:
 
         # For interactive ncurses UI, we can't capture output
         self.logger.command(["make", f"-j{self.build_jobs}", "nconfig"])
-        try:
-            # Run without capturing output to allow interactive UI
-            result = subprocess.run(
-                ["make", f"-j{self.build_jobs}", "nconfig"],
-                cwd=self.linux_dir,
-                check=True
-            )
-            if result.returncode != 0:
-                self.logger.error(f"Конфигурация завершилась с ошибкой {result.returncode}")
-                sys.exit(result.returncode)
-        except Exception as e:
-            self.logger.error(f"Ошибка при запуске nconfig: {e}")
-            sys.exit(1)
+
+        # Run without capturing output to allow interactive UI
+        result = subprocess.run(
+            ["make", f"-j{self.build_jobs}", "nconfig"],
+            cwd=self.linux_dir,
+            check=False
+        )
+        if result.returncode != 0:
+            self.logger.error(f"Конфигурация завершилась с ошибкой {result.returncode}")
+            sys.exit(result.returncode)
 
         config_path = os.path.join(self.linux_dir, ".config")
         backup_path = os.path.join(self.backup_config_dir, ".config.latest")
         if os.path.exists(config_path):
-            try:
-                shutil.copy2(config_path, backup_path)
-                self.logger.info(f"Текущий .config скопирован в {backup_path}")
-            except (OSError, shutil.Error) as e:
-                self.logger.error(f"Ошибка при копировании .config: {e}")
+            shutil.copy2(config_path, backup_path)
+            self.logger.info(f"Текущий .config скопирован в {backup_path}")
 
     def build(self):
         """Build the kernel only, not the initramfs"""
@@ -277,7 +212,7 @@ class Kernel:
         self.logger.info("Сборка ядра завершена.")
         self._built = True
 
-    def is_kernel_built(self) -> bool:
+    def is_kernel_built(self):
         """Check if kernel has been built"""
         if self._built:
             return True
@@ -285,10 +220,19 @@ class Kernel:
         # Check for kernel binary
         vmlinuz = os.path.join(self.linux_dir, "arch/x86/boot/bzImage")
         if not os.path.exists(vmlinuz):
-            self.logger.warning("Ядро не скомпилировано (bzImage не найден)")
+            self.logger.info("Ядро не скомпилировано (bzImage не найден)")
             return False
 
         return True
+
+    def create_temp_dir(self):
+        """Create a temporary directory for kernel installation"""
+        self.temp_dir = os.path.join("/tmp", f"kernel-build-{self.build_datetime}")
+        os.makedirs(self.temp_dir, exist_ok=True)
+        temp_boot = os.path.join(self.temp_dir, "boot")
+        os.makedirs(temp_boot, exist_ok=True)
+        self.logger.info(f"Created temporary directory: {self.temp_dir}")
+        return self.temp_dir
 
     def install(self):
         """Install the built kernel and modules, build initramfs"""
@@ -296,101 +240,83 @@ class Kernel:
             self.logger.error("Ядро не скомпилировано. Сначала выполните 'build'")
             sys.exit(1)
 
-        self.logger.info("---> Установка ядра <---")
-        self.run(["make", "modules_install", "install"], cwd=self.linux_dir)
+        # Create temporary directory
+        temp_dir = self.create_temp_dir()
+        temp_boot = os.path.join(temp_dir, "boot")
 
-        self.logger.info("---> Сборка и установка initramfs <---")
-        genkernel_cmd = ["genkernel"] + self.initramfs_args + ["initramfs"]
+        self.logger.info("---> Установка ядра во временную директорию <---")
+        # Install to temp directory
+        self.run(["make", "install", f"INSTALL_PATH={temp_boot}"], cwd=self.linux_dir)
+
+        self.logger.info("---> Сборка и установка initramfs во временную директорию <---")
+        # Build initramfs to temp directory
+        genkernel_cmd = ["genkernel"] + self.initramfs_args + [f"--kernel-filenames={temp_boot}", "initramfs"]
         self.run(genkernel_cmd)
 
-        self.logger.info("---> Переименование файлов ядра <---")
-        self.rename_kernel_files()
+        self.logger.info("Ядро и initramfs подготовлены во временной директории.")
+        return temp_dir
+
+    def install_to_device(self, device):
+        """Install modules and copy kernel files to the real location"""
+        self.logger.info("---> Установка модулей ядра <---")
+        self.run(["make", "modules_install"], cwd=self.linux_dir)
+
+        self.logger.info("---> Копирование файлов ядра с временным суффиксом <---")
+        dt = self.build_datetime
+        kv = self.kernel_version
+
+        # Copy files from temp dir to real boot mountpoint
+        temp_boot = os.path.join(self.temp_dir, "boot")
+        for f in os.listdir(temp_boot):
+            src = os.path.join(temp_boot, f)
+            if os.path.isfile(src):
+                # Add datetime suffix to filename
+                base, ext = os.path.splitext(f)
+                if not ext:  # For files like "vmlinuz" with no extension
+                    dst = os.path.join(device.mountpoint, f"{f}-{kv}-{dt}")
+                else:
+                    dst = os.path.join(device.mountpoint, f"{base}-{kv}-{dt}{ext}")
+
+                self.logger.info(f"{src} -> {dst}")
+                shutil.copy2(src, dst)
+
         self.run(["grub-mkconfig", "-o", "/boot/grub/grub.cfg"])
         self.logger.info("Установка завершена.")
 
-    def rename_kernel_files(self):
-        dt = self.build_datetime
-        kv = self.kernel_version
-        boot = self.boot_mountpoint
-
-        # Ensure boot directory exists
-        if not os.path.exists(boot):
-            self.logger.error(f"Boot directory {boot} does not exist")
-            return
-
-        for f in ["System.map", "vmlinuz"]:
-            src = os.path.join(boot, f)
-            if os.path.exists(src):
-                dst = os.path.join(boot, f"{f}-{kv}-{dt}")
-                self.logger.info(f"{src} -> {dst}")
-                try:
-                    shutil.copy2(src, dst)
-                except (OSError, shutil.Error) as e:
-                    self.logger.error(f"Ошибка при копировании {src}: {e}")
-
-        irfs_name = f"initramfs-{kv}.img"
-        irfs_src = os.path.join(boot, irfs_name)
-        if os.path.exists(irfs_src):
-            irfs_dst = os.path.join(boot, f"initramfs-{kv}-{dt}.img")
-            self.logger.info(f"{irfs_src} -> {irfs_dst}")
-            try:
-                shutil.copy2(irfs_src, irfs_dst)
-            except (OSError, shutil.Error) as e:
-                self.logger.error(f"Ошибка при копировании {irfs_src}: {e}")
-
 class BootDevice:
-    def __init__(self, device: str, partition: str, mountpoint: str, logger: Logger):
+    def __init__(self, device, partition, mountpoint, logger):
         self.device = device
         self.partition = partition
         self.mountpoint = mountpoint
         self.logger = logger
 
-        # Verify devices exist
-        self.verify_device()
-
-    def verify_device(self):
-        """Check if the device exists"""
-        dev = self.device + self.partition
-        if not os.path.exists(dev):
-            self.logger.warning(f"Устройство {dev} не найдено!")
-
     def mount(self):
         dev = self.device + self.partition
         self.logger.info(f"Монтирование {dev} в {self.mountpoint}")
-        try:
-            result = subprocess.run(["mount", dev, self.mountpoint],
-                                   text=True, capture_output=True, check=True)
-            if result.stdout:
-                self.logger.command_output(result.stdout)
-        except subprocess.CalledProcessError as e:
-            self.logger.error(f"Ошибка при монтировании {dev}: {e}")
-            self.logger.error(e.stderr)
-            raise
+        result = subprocess.run(["mount", dev, self.mountpoint],
+                               text=True, capture_output=True, check=True)
+        if result.stdout:
+            self.logger.command_output(result.stdout)
 
     def umount(self):
         self.logger.info(f"Отмонтирование {self.mountpoint}")
-        try:
-            result = subprocess.run(["umount", self.mountpoint],
-                                   text=True, capture_output=True, check=False)
-            if result.stdout:
-                self.logger.command_output(result.stdout)
-            if result.stderr and "not mounted" not in result.stderr.lower():
-                self.logger.command_output(result.stderr, error=True)
-        except Exception as e:
-            self.logger.error(f"Ошибка при отмонтировании {self.mountpoint}: {e}")
+        subprocess.run(["umount", self.mountpoint], check=False)
 
     def show_boot(self):
+        self.logger.info(f"Содержимое {self.mountpoint}:")
         try:
-            result = subprocess.run(["ls", "-la", self.mountpoint],
-                                  text=True, capture_output=True)
-            self.logger.info(f"Содержимое {self.mountpoint}:")
-            self.logger.command_output(result.stdout)
-            if result.stderr:
-                self.logger.command_output(result.stderr, error=True)
+            for filename in os.listdir(self.mountpoint):
+                file_path = os.path.join(self.mountpoint, filename)
+                if os.path.isfile(file_path):
+                    stat_info = os.stat(file_path)
+                    # Get modification time in a readable format
+                    mod_time = datetime.datetime.fromtimestamp(stat_info.st_mtime)
+                    time_str = mod_time.strftime("%Y-%m-%d %H:%M:%S")
+                    self.logger.command_output(f"{filename:<30} {time_str}")
         except Exception as e:
-            self.logger.error(f"Ошибка при просмотре содержимого {self.mountpoint}: {e}")
+            self.logger.error(f"Ошибка при чтении содержимого {self.mountpoint}: {e}")
 
-    def find_grub_path(self) -> str:
+    def find_grub_path(self):
         """Find the correct grub.cfg path on the mounted device"""
         possible_paths = [
             os.path.join(self.mountpoint, "grub"),
@@ -404,18 +330,66 @@ class BootDevice:
                 return os.path.join(path, "grub.cfg")
 
         # Default to standard path if not found
-        self.logger.warning("Grub directory not found, using default path")
         return os.path.join(self.mountpoint, "grub/grub.cfg")
 
-    def install_kernel(self, kernel: Kernel):
+    def install_grub_bootloader(self):
+        """Install GRUB bootloader to the device's boot sector for both BIOS and EFI if available"""
+        self.logger.info(f"---> Установка GRUB в загрузочную область устройства {self.device} <---")
+
+        success = False
+
+        # Install for BIOS boot
+        self.logger.info(f"Установка GRUB для BIOS (i386-pc)")
+        bios_cmd = ["grub-install", "--target=i386-pc", "--recheck",
+                    f"--boot-directory={self.mountpoint}", self.device]
+        bios_result = subprocess.run(bios_cmd, text=True, capture_output=True, check=False)
+
+        if bios_result.stdout:
+            self.logger.command_output(bios_result.stdout)
+        if bios_result.stderr:
+            self.logger.command_output(bios_result.stderr, error=True)
+
+        if bios_result.returncode == 0:
+            success = True
+            self.logger.info(f"GRUB успешно установлен для BIOS на устройство {self.device}")
+        else:
+            self.logger.error(f"Установка GRUB для BIOS завершилась с ошибкой")
+
+        # EFI installation - the mountpoint itself is the EFI directory for flash drives
+        # Add --removable flag for compatibility with more systems
+        self.logger.info(f"Установка GRUB для UEFI (x86_64-efi)")
+        efi_cmd = ["grub-install", "--target=x86_64-efi", "--recheck",
+                  f"--efi-directory={self.mountpoint}", "--bootloader-id=GRUB",
+                  "--removable", self.device]
+        efi_result = subprocess.run(efi_cmd, text=True, capture_output=True, check=False)
+
+        if efi_result.stdout:
+            self.logger.command_output(efi_result.stdout)
+        if efi_result.stderr:
+            self.logger.command_output(efi_result.stderr, error=True)
+
+        if efi_result.returncode == 0:
+            success = True
+            self.logger.info(f"GRUB успешно установлен для UEFI на устройство {self.device}")
+        else:
+            self.logger.error(f"Установка GRUB для UEFI завершилась с ошибкой")
+
+        if not success:
+            self.logger.error(f"Установка GRUB не удалась ни в одном режиме")
+
+    def install_kernel(self, kernel):
         try:
             self.umount()
             self.mount()
             self.logger.info(f"---> Файлы в {self.mountpoint} до установки:")
             self.show_boot()
 
-            # Only install - no building
-            kernel.install()
+            # Prepare kernel files in temporary directory
+            if not kernel.temp_dir:
+                kernel.install()
+
+            # Install modules and copy files to actual device
+            kernel.install_to_device(self)
 
             self.logger.info(f"---> Файлы в {self.mountpoint} после установки:")
             self.show_boot()
@@ -436,10 +410,8 @@ class BootDevice:
             if result.stderr:
                 self.logger.command_output(result.stderr, error=True)
 
-            if result.returncode != 0:
-                self.logger.error(f"Ошибка при создании grub.cfg: код {result.returncode}")
-        except Exception as e:
-            self.logger.error(f"Ошибка при установке ядра: {e}")
+            # Install GRUB bootloader to the device
+            self.install_grub_bootloader()
         finally:
             self.umount()
 
@@ -462,9 +434,8 @@ def main():
         if args.command == "configure":
             kernel.configure()
         elif args.command == "build":
-            kernel.build()  # Only build, no installation
+            kernel.build()
         elif args.command == "install":
-            # First check if kernel is built
             if not kernel.is_kernel_built():
                 config.logger.error("Ядро не скомпилировано. Сначала выполните 'build'")
                 sys.exit(1)
@@ -477,10 +448,7 @@ def main():
                     mountpoint=config.get("boot_mountpoint"),
                     logger=config.logger
                 )
-                device.install_kernel(kernel)  # This will install only, not build
-        else:
-            config.logger.error("Неизвестная команда")
-            sys.exit(2)
+                device.install_kernel(kernel)
     except KeyboardInterrupt:
         config.logger.error("Прервано пользователем")
         sys.exit(130)
