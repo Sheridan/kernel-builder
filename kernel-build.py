@@ -7,14 +7,90 @@ import sys
 import shutil
 import json
 import datetime
+import logging
+from typing import Union, List, Dict, Any, Optional
+
+class Logger:
+    def __init__(self, config: dict):
+        self.log_file = config.get("log_file", "/var/log/kernel-build.log")
+        log_level_str = config.get("log_level", "INFO").upper()
+        level_map = {
+            "DEBUG": logging.DEBUG,
+            "INFO": logging.INFO,
+            "WARNING": logging.WARNING,
+            "ERROR": logging.ERROR
+        }
+        log_level = level_map.get(log_level_str, logging.INFO)
+
+        # Create log directory if it doesn't exist
+        try:
+            log_dir = os.path.dirname(self.log_file)
+            if log_dir and not os.path.exists(log_dir):
+                os.makedirs(log_dir, exist_ok=True)
+        except OSError as e:
+            print(f"Warning: Cannot create log directory: {e}", file=sys.stderr)
+            self.log_file = None
+
+        # Configure logging
+        self.logger = logging.getLogger("kernel-build")
+        self.logger.setLevel(log_level)
+
+        # Remove any existing handlers
+        self.logger.handlers = []
+
+        # File handler
+        if self.log_file:
+            try:
+                file_handler = logging.FileHandler(self.log_file)
+                file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+                file_handler.setFormatter(file_formatter)
+                self.logger.addHandler(file_handler)
+            except (OSError, PermissionError) as e:
+                print(f"Warning: Cannot write to log file: {e}", file=sys.stderr)
+
+        # Console handler
+        console_handler = logging.StreamHandler()
+        console_formatter = logging.Formatter('%(message)s')
+        console_handler.setFormatter(console_formatter)
+        self.logger.addHandler(console_handler)
+
+    def debug(self, message):
+        self.logger.debug(message)
+
+    def info(self, message):
+        self.logger.info(message)
+
+    def warning(self, message):
+        self.logger.warning(message)
+
+    def error(self, message):
+        self.logger.error(message)
+
+    def command(self, cmd):
+        cmd_str = ' '.join(cmd) if isinstance(cmd, list) else cmd
+        self.logger.info(f"==> {cmd_str}")
+
+    def command_output(self, output, error=False):
+        lines = output.strip().split('\n')
+        for line in lines:
+            if line:
+                if error:
+                    self.logger.error(f"   {line}")
+                else:
+                    self.logger.debug(f"   {line}")
 
 class Config:
     def __init__(self, path):
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Config file not found: {path}")
-        with open(path) as f:
-            self.data = json.load(f)
+        try:
+            with open(path) as f:
+                self.data = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in config file: {e}")
+
         self.validate()
+        self.logger = Logger(self.data)
 
     def validate(self):
         required = [
@@ -25,14 +101,24 @@ class Config:
             if key not in self.data:
                 raise ValueError(f"Missing key in config: {key}")
 
-    def get(self, key):
-        return self.data[key]
+        # Check if directories exist and are accessible
+        dirs_to_check = ["linux_dir", "backup_config_dir", "boot_mountpoint"]
+        for dir_key in dirs_to_check:
+            dir_path = self.data[dir_key]
+            if not os.path.exists(dir_path):
+                raise ValueError(f"Directory does not exist: {dir_path} ({dir_key})")
+            if not os.access(dir_path, os.R_OK):
+                raise ValueError(f"Directory is not readable: {dir_path} ({dir_key})")
+
+    def get(self, key, default=None):
+        return self.data.get(key, default)
 
     def get_flash_devices(self):
         return self.data["flash_devices"]
 
 class Kernel:
     def __init__(self, config: Config):
+        self.config = config
         self.linux_dir = config.get("linux_dir")
         self.backup_config_dir = config.get("backup_config_dir")
         self.boot_mountpoint = config.get("boot_mountpoint")
@@ -40,14 +126,19 @@ class Kernel:
         self.build_jobs = config.get("build_jobs")
         self._kernel_version = None
         self._build_datetime = None
+        self.logger = config.logger
 
     @property
     def kernel_version(self):
         if not self._kernel_version:
             rel_file = os.path.join(self.linux_dir, "include/config/kernel.release")
             if os.path.isfile(rel_file):
-                with open(rel_file) as f:
-                    self._kernel_version = f.read().strip()
+                try:
+                    with open(rel_file) as f:
+                        self._kernel_version = f.read().strip()
+                except IOError as e:
+                    self.logger.error(f"Cannot read kernel version file: {e}")
+                    self._kernel_version = "unknown"
             else:
                 self._kernel_version = "unknown"
         return self._kernel_version
@@ -58,23 +149,46 @@ class Kernel:
             self._build_datetime = datetime.datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
         return self._build_datetime
 
-    def run(self, cmd, cwd=None, check=True):
-        print(f"==> {' '.join(cmd) if isinstance(cmd, list) else cmd}")
-        result = subprocess.run(cmd, shell=isinstance(cmd, str), cwd=cwd)
-        if check and result.returncode != 0:
-            print(f"Ошибка выполнения: {cmd}", file=sys.stderr)
-            sys.exit(result.returncode)
+    def run(self, cmd: Union[List[str], str], cwd: Optional[str] = None, check: bool = True) -> subprocess.CompletedProcess:
+        self.logger.command(cmd)
+        try:
+            result = subprocess.run(
+                cmd,
+                shell=isinstance(cmd, str),
+                cwd=cwd,
+                text=True,
+                capture_output=True
+            )
+
+            # Log stdout and stderr
+            if result.stdout:
+                self.logger.command_output(result.stdout)
+            if result.stderr:
+                self.logger.command_output(result.stderr, error=True)
+
+            if check and result.returncode != 0:
+                self.logger.error(f"Command failed with exit code {result.returncode}")
+                sys.exit(result.returncode)
+            return result
+        except Exception as e:
+            self.logger.error(f"Failed to execute command: {e}")
+            if check:
+                sys.exit(1)
+            raise
 
     def backup_config(self):
         src = os.path.join(self.linux_dir, ".config")
         if os.path.exists(src):
-            os.makedirs(self.backup_config_dir, exist_ok=True)
-            dt = datetime.datetime.now().strftime("%Y.%m.%d-%H:%M:%S")
-            dst = os.path.join(self.backup_config_dir, f".config.{dt}")
-            shutil.copy2(src, dst)
-            print(f"Старая конфигурация ядра сохранена: {dst}")
+            try:
+                os.makedirs(self.backup_config_dir, exist_ok=True)
+                dt = datetime.datetime.now().strftime("%Y.%m.%d-%H:%M:%S")
+                dst = os.path.join(self.backup_config_dir, f".config.{dt}")
+                shutil.copy2(src, dst)
+                self.logger.info(f"Старая конфигурация ядра сохранена: {dst}")
+            except (OSError, shutil.Error) as e:
+                self.logger.error(f"Ошибка при бэкапе конфигурации: {e}")
         else:
-            print(f".config не найден, пропуск бэкапа.")
+            self.logger.info(f".config не найден, пропуск бэкапа.")
 
     def configure(self):
         self.backup_config()
@@ -82,20 +196,23 @@ class Kernel:
         config_path = os.path.join(self.linux_dir, ".config")
         backup_path = os.path.join(self.backup_config_dir, ".config.latest")
         if os.path.exists(config_path):
-            shutil.copy2(config_path, backup_path)
-            print(f"Текущий .config скопирован в {backup_path}")
+            try:
+                shutil.copy2(config_path, backup_path)
+                self.logger.info(f"Текущий .config скопирован в {backup_path}")
+            except (OSError, shutil.Error) as e:
+                self.logger.error(f"Ошибка при копировании .config: {e}")
 
     def build(self):
-        print("---> Сборка ядра <---")
+        self.logger.info("---> Сборка ядра <---")
         self.run(["make", f"-j{self.build_jobs}", "bzImage", "modules"], cwd=self.linux_dir)
         self.run(["make", "modules_install", "install"], cwd=self.linux_dir)
-        print("---> Сборка initramfs <---")
+        self.logger.info("---> Сборка initramfs <---")
         genkernel_cmd = ["genkernel"] + self.initramfs_args + ["initramfs"]
         self.run(genkernel_cmd)
-        print("---> Переименование файлов ядра <---")
+        self.logger.info("---> Переименование файлов ядра <---")
         self.rename_kernel_files()
         self.run(["grub-mkconfig", "-o", "/boot/grub/grub.cfg"])
-        print("Сборка завершена.")
+        self.logger.info("Сборка завершена.")
 
     def rename_kernel_files(self):
         dt = self.build_datetime
@@ -105,51 +222,98 @@ class Kernel:
             src = os.path.join(boot, f)
             if os.path.exists(src):
                 dst = os.path.join(boot, f"{f}-{kv}-{dt}")
-                print(f"{src} -> {dst}")
-                shutil.copy2(src, dst)
+                self.logger.info(f"{src} -> {dst}")
+                try:
+                    shutil.copy2(src, dst)
+                except (OSError, shutil.Error) as e:
+                    self.logger.error(f"Ошибка при копировании {src}: {e}")
+
         irfs_name = f"initramfs-{kv}.img"
         irfs_src = os.path.join(boot, irfs_name)
         if os.path.exists(irfs_src):
             irfs_dst = os.path.join(boot, f"initramfs-{kv}-{dt}.img")
-            print(f"{irfs_src} -> {irfs_dst}")
-            shutil.copy2(irfs_src, irfs_dst)
+            self.logger.info(f"{irfs_src} -> {irfs_dst}")
+            try:
+                shutil.copy2(irfs_src, irfs_dst)
+            except (OSError, shutil.Error) as e:
+                self.logger.error(f"Ошибка при копировании {irfs_src}: {e}")
 
 class BootDevice:
-    def __init__(self, device, partition, mountpoint):
+    def __init__(self, device: str, partition: str, mountpoint: str, logger: Logger):
         self.device = device
         self.partition = partition
         self.mountpoint = mountpoint
+        self.logger = logger
 
     def mount(self):
         dev = self.device + self.partition
-        print(f"Монтирование {dev} в {self.mountpoint}")
-        subprocess.run(["mount", dev, self.mountpoint], check=True)
+        self.logger.info(f"Монтирование {dev} в {self.mountpoint}")
+        try:
+            result = subprocess.run(["mount", dev, self.mountpoint],
+                                   text=True, capture_output=True, check=True)
+            if result.stdout:
+                self.logger.command_output(result.stdout)
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"Ошибка при монтировании {dev}: {e}")
+            self.logger.error(e.stderr)
+            raise
 
     def umount(self):
-        print(f"Отмонтирование {self.mountpoint}")
-        subprocess.run(["umount", self.mountpoint], check=False)
+        self.logger.info(f"Отмонтирование {self.mountpoint}")
+        try:
+            result = subprocess.run(["umount", self.mountpoint],
+                                   text=True, capture_output=True, check=False)
+            if result.stdout:
+                self.logger.command_output(result.stdout)
+            if result.stderr and "not mounted" not in result.stderr.lower():
+                self.logger.command_output(result.stderr, error=True)
+        except Exception as e:
+            self.logger.error(f"Ошибка при отмонтировании {self.mountpoint}: {e}")
 
     def show_boot(self):
-        subprocess.run(["ls", "-la", self.mountpoint])
+        try:
+            result = subprocess.run(["ls", "-la", self.mountpoint],
+                                  text=True, capture_output=True)
+            self.logger.info(f"Содержимое {self.mountpoint}:")
+            self.logger.command_output(result.stdout)
+            if result.stderr:
+                self.logger.command_output(result.stderr, error=True)
+        except Exception as e:
+            self.logger.error(f"Ошибка при просмотре содержимого {self.mountpoint}: {e}")
 
     def install_kernel(self, kernel: Kernel):
-        self.umount()
-        self.mount()
-        print(f"---> Файлы в {self.mountpoint} до установки:")
-        self.show_boot()
-        kernel.build()
-        print(f"---> Файлы в {self.mountpoint} после установки:")
-        self.show_boot()
-        print("---> Генерация grub.cfg на устройстве")
-        subprocess.run(["grub-mkconfig", "-o", os.path.join(self.mountpoint, "grub/grub.cfg")], check=True)
-        self.umount()
+        try:
+            self.umount()
+            self.mount()
+            self.logger.info(f"---> Файлы в {self.mountpoint} до установки:")
+            self.show_boot()
+            kernel.build()
+            self.logger.info(f"---> Файлы в {self.mountpoint} после установки:")
+            self.show_boot()
+            self.logger.info("---> Генерация grub.cfg на устройстве")
+
+            grub_cfg_path = os.path.join(self.mountpoint, "grub/grub.cfg")
+            result = subprocess.run(["grub-mkconfig", "-o", grub_cfg_path],
+                                   text=True, capture_output=True)
+
+            if result.stdout:
+                self.logger.command_output(result.stdout)
+            if result.stderr:
+                self.logger.command_output(result.stderr, error=True)
+
+            if result.returncode != 0:
+                self.logger.error(f"Ошибка при создании grub.cfg: код {result.returncode}")
+        except Exception as e:
+            self.logger.error(f"Ошибка при установке ядра: {e}")
+        finally:
+            self.umount()
 
 def main():
     parser = argparse.ArgumentParser(
         description="Gentoo Kernel builder",
         formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("command", choices=["build", "configure", "install"])
-    parser.add_argument("-c", "--config", default="kernel_builder.json", help="Путь к json-конфигу")
+    parser.add_argument("-c", "--config", default="/etc/kernel_builder.json", help="Путь к json-конфигу")
     args = parser.parse_args()
 
     try:
@@ -159,22 +323,30 @@ def main():
         print(f"Ошибка: {e}", file=sys.stderr)
         sys.exit(1)
 
-    if args.command == "configure":
-        kernel.configure()
-    elif args.command == "build":
-        kernel.build()
-    elif args.command == "install":
-        flashlist = config.get_flash_devices()
-        for flash in flashlist:
-            device = BootDevice(
-                device=flash["device"],
-                partition=flash["partition"],
-                mountpoint=config.get("boot_mountpoint")
-            )
-            device.install_kernel(kernel)
-    else:
-        print("Неизвестная команда")
-        sys.exit(2)
+    try:
+        if args.command == "configure":
+            kernel.configure()
+        elif args.command == "build":
+            kernel.build()
+        elif args.command == "install":
+            flashlist = config.get_flash_devices()
+            for flash in flashlist:
+                device = BootDevice(
+                    device=flash["device"],
+                    partition=flash["partition"],
+                    mountpoint=config.get("boot_mountpoint"),
+                    logger=config.logger
+                )
+                device.install_kernel(kernel)
+        else:
+            config.logger.error("Неизвестная команда")
+            sys.exit(2)
+    except KeyboardInterrupt:
+        config.logger.error("Прервано пользователем")
+        sys.exit(130)
+    except Exception as e:
+        config.logger.error(f"Критическая ошибка: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

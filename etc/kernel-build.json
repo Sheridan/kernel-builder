@@ -4,6 +4,8 @@
   "boot_mountpoint": "/boot",
   "initramfs_args": ["--btrfs", "--no-zfs", "--no-lvm", "--no-dmraid", "--no-luks"],
   "build_jobs": 8,
+  "log_file": "/var/log/kernel-build/build.log",
+  "log_level": "INFO",
   "flash_devices": [
     { "device": "/dev/disk/by-id/usb-_USB_DISK_2.0_9000736584240B87-0:0", "partition": "-part1" },
     { "device": "/dev/disk/by-id/usb-UFD_2.0_Silicon-Power4G_201210SP0069070D2B166F327E21-0:0", "partition": "-part1" }
