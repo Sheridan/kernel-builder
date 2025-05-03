@@ -192,7 +192,23 @@ class Kernel:
 
     def configure(self):
         self.backup_config()
-        self.run(["make", f"-j{self.build_jobs}", "nconfig"], cwd=self.linux_dir)
+
+        # For interactive ncurses UI, we can't capture output
+        self.logger.command(["make", f"-j{self.build_jobs}", "nconfig"])
+        try:
+            # Run without capturing output to allow interactive UI
+            result = subprocess.run(
+                ["make", f"-j{self.build_jobs}", "nconfig"],
+                cwd=self.linux_dir,
+                check=True
+            )
+            if result.returncode != 0:
+                self.logger.error(f"Конфигурация завершилась с ошибкой {result.returncode}")
+                sys.exit(result.returncode)
+        except Exception as e:
+            self.logger.error(f"Ошибка при запуске nconfig: {e}")
+            sys.exit(1)
+
         config_path = os.path.join(self.linux_dir, ".config")
         backup_path = os.path.join(self.backup_config_dir, ".config.latest")
         if os.path.exists(config_path):
