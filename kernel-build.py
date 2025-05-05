@@ -249,12 +249,14 @@ class Kernel:
         self.run(["make", "install", f"INSTALL_PATH={temp_boot}"], cwd=self.linux_dir)
 
         self.logger.info("---> Сборка и установка initramfs во временную директорию <---")
-        # Build initramfs to temp directory
-        genkernel_cmd = ["genkernel"] + self.initramfs_args + [f"--kernel-filenames={temp_boot}", "initramfs"]
+        # Update this line to use correct genkernel syntax
+        # genkernel_cmd = ["genkernel"] + self.initramfs_args + [f"--kernel-filenames={temp_boot}", "initramfs"]
+        genkernel_cmd = ["genkernel"] + self.initramfs_args + [f"--bootdir={temp_boot}", "initramfs"]
         self.run(genkernel_cmd)
 
         self.logger.info("Ядро и initramfs подготовлены во временной директории.")
         return temp_dir
+
 
     def install_to_device(self, device):
         """Install modules and copy kernel files to the real location"""
